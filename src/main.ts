@@ -1,99 +1,128 @@
-import {App, Editor, MarkdownView, Modal, Notice, Plugin} from 'obsidian';
-import {DEFAULT_SETTINGS, MyPluginSettings, SampleSettingTab} from "./settings";
+import { Plugin, Notice, TFile } from 'obsidian';
+import {DEFAULT_SETTINGS, YandexDiskSettings} from "./mod";
+import {YandexDiskSettingTab} from "./settings";
+import {YandexDiskClient} from "./yandex_client"
 
-// Remember to rename these classes and interfaces!
 
-export default class MyPlugin extends Plugin {
-	settings: MyPluginSettings;
+export default class YandexDiskSyncPlugin extends Plugin {
+	settings: YandexDiskSettings;
+	private readonly folderCache = new Set<string>();
 
 	async onload() {
 		await this.loadSettings();
 
-		// This creates an icon in the left ribbon.
-		this.addRibbonIcon('dice', 'Sample', (evt: MouseEvent) => {
-			// Called when the user clicks the icon.
-			new Notice('This is a notice!');
-		});
+		// Иконка в боковой панели
+		this.addRibbonIcon('cloud', 'Sync all to yandex disk', () => this.syncAllFiles());
+		this.addSettingTab(new YandexDiskSettingTab(this.app, this));
+	}
 
-		// This adds a status bar item to the bottom of the app. Does not work on mobile apps.
-		const statusBarItemEl = this.addStatusBarItem();
-		statusBarItemEl.setText('Status bar text');
+    async syncAllFiles() {
+		// Проверка токена
+		if (!this.settings.oauthToken) {
+			new Notice('Ошибка: введите auth токен в настройках!');
+			return;
+		}
 
-		// This adds a simple command that can be triggered anywhere
-		this.addCommand({
-			id: 'open-modal-simple',
-			name: 'Open modal (simple)',
-			callback: () => {
-				new SampleModal(this.app).open();
-			}
-		});
-		// This adds an editor command that can perform some operation on the current editor instance
-		this.addCommand({
-			id: 'replace-selected',
-			name: 'Replace selected content',
-			editorCallback: (editor: Editor, view: MarkdownView) => {
-				editor.replaceSelection('Sample editor command');
-			}
-		});
-		// This adds a complex command that can check whether the current state of the app allows execution of the command
-		this.addCommand({
-			id: 'open-modal-complex',
-			name: 'Open modal (complex)',
-			checkCallback: (checking: boolean) => {
-				// Conditions to check
-				const markdownView = this.app.workspace.getActiveViewOfType(MarkdownView);
-				if (markdownView) {
-					// If checking is true, we're simply "checking" if the command can be run.
-					// If checking is false, then we want to actually perform the operation.
-					if (!checking) {
-						new SampleModal(this.app).open();
+		// Создаем клиент для работы с API
+		const client = new YandexDiskClient(this.settings.oauthToken);
+
+		new Notice('Запуск синхронизации...');
+
+		try {
+            new Notice('Анализ файлов...');
+			// Список файлов которые есть на яндекс диске
+			// Нужно для обновления списка фойлов
+            const remoteFiles = await client.getRemoteFiles(this.settings.remotePath);
+
+			// Список файлов для загрузки
+            const tasks = this.prepareTasks(remoteFiles);
+			const total = tasks.length;
+
+			// Если файлов нет то значит все актуально
+            if (total === 0) {
+                new Notice('Все файлы актуальны.');
+                return;
+            }
+
+			// Запуск синхронизации файлов
+            // Устанавливаем длительность 0, чтобы он не исчез раньше времени автоматически.
+        	const progressNotice = new Notice(`Подготовка к загрузке 0/${total}...`, 0);
+
+			// Параллельная загрузка файлов
+            const uploaded = await this.runUploadPool(tasks, client, progressNotice, 5, total);
+            // После завершения скрываем или меняем сообщение и даем ему закрыться через 5 сек
+        	progressNotice.setMessage(`✅ Готово! Загружено: ${uploaded}`);
+        	setTimeout(() => progressNotice.hide(), 5000)
+
+			// Очистка кэша
+            this.folderCache.clear();
+        } catch (error) {
+            console.error(error);
+            new Notice('Ошибка при синхронизации.');
+        }
+	}
+
+	// Определяем файлы необходиммые для загрузки
+	private prepareTasks(remoteFiles: Map<string, string>): TFile[] {
+        const localFiles = this.app.vault.getFiles()
+            .filter(f => !f.path.startsWith('.obsidian/'));
+        return localFiles.filter(file => {
+            const remoteModified = remoteFiles.get(file.path);
+            if (!remoteModified) return true; // Провека файла на наличие на диске
+            return file.stat.mtime > (new Date(remoteModified).getTime() + 2000);
+        });
+    }
+
+	private async runUploadPool(tasks: TFile[], client: YandexDiskClient, progressNotice: Notice ,concurrency: number, total: number): Promise<number> {
+        let count = 0;
+		let finished = 0;
+        const worker = async () => {
+            while (tasks.length > 0) {
+                const file = tasks.shift(); // Берем каждый файл по очереди
+                if (!file) break;
+
+				try {
+					await this.ensureRemoteFolderExists(file.path, client);
+					const content = await this.app.vault.readBinary(file);
+					const targetPath = `${this.settings.remotePath}/${file.path}`;
+
+					if (await client.uploadFile(targetPath, content)) {
+						count++;
 					}
-
-					// This command will only show up in Command Palette when the check function returns true
-					return true;
 				}
-				return false;
+				catch (error) {
+					new Notification(`Ошибка при загрузке файла ${file.path}: ${error}`);
+				}
+				finally {
+                finished++;
+                // Обновляем текст в уведомлении
+                const percent = Math.round((finished / total) * 100);
+                progressNotice.setMessage(`Загрузка: ${finished}/${total} (${percent}%) \n${file.name}`);
+				}
+            }
+        };
+
+		// Запускаем 5 воркеров параллельно
+        await Promise.all(new Array(concurrency).fill(null).map(() => worker()));
+        return count;
+    }
+
+	private async ensureRemoteFolderExists(filePath: string, client: YandexDiskClient) {
+		const parts = filePath.split('/');
+		parts.pop(); // Убираем имя файла, оставляем только путь
+
+		let currentPath = this.settings.remotePath;
+
+		for (const part of parts) {
+			currentPath += '/' + part;
+			if (!this.folderCache.has(currentPath)) {
+				await client.createFolder(currentPath);
+				this.folderCache.add(currentPath);
 			}
-		});
-
-		// This adds a settings tab so the user can configure various aspects of the plugin
-		this.addSettingTab(new SampleSettingTab(this.app, this));
-
-		// If the plugin hooks up any global DOM events (on parts of the app that doesn't belong to this plugin)
-		// Using this function will automatically remove the event listener when this plugin is disabled.
-		this.registerDomEvent(document, 'click', (evt: MouseEvent) => {
-			new Notice("Click");
-		});
-
-		// When registering intervals, this function will automatically clear the interval when the plugin is disabled.
-		this.registerInterval(window.setInterval(() => console.log('setInterval'), 5 * 60 * 1000));
-
+		}
 	}
 
-	onunload() {
-	}
+	async loadSettings() { this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData()); }
+    async saveSettings() { await this.saveData(this.settings); }
 
-	async loadSettings() {
-		this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData() as Partial<MyPluginSettings>);
-	}
-
-	async saveSettings() {
-		await this.saveData(this.settings);
-	}
-}
-
-class SampleModal extends Modal {
-	constructor(app: App) {
-		super(app);
-	}
-
-	onOpen() {
-		let {contentEl} = this;
-		contentEl.setText('Woah!');
-	}
-
-	onClose() {
-		const {contentEl} = this;
-		contentEl.empty();
-	}
 }

@@ -1,36 +1,27 @@
 import {App, PluginSettingTab, Setting} from "obsidian";
-import MyPlugin from "./main";
+import YandexDiskSyncPlugin from "./main";
 
-export interface MyPluginSettings {
-	mySetting: string;
-}
+export class YandexDiskSettingTab extends PluginSettingTab {
 
-export const DEFAULT_SETTINGS: MyPluginSettings = {
-	mySetting: 'default'
-}
+    plugin: YandexDiskSyncPlugin;
+    constructor(app: App, plugin: YandexDiskSyncPlugin) { super(app, plugin); this.plugin = plugin; }
 
-export class SampleSettingTab extends PluginSettingTab {
-	plugin: MyPlugin;
+    display(): void {
+        const { containerEl } = this;
+        containerEl.empty();
+        containerEl.createEl('h2', { text: 'Настройки Yandex Disk Sync' });
 
-	constructor(app: App, plugin: MyPlugin) {
-		super(app, plugin);
-		this.plugin = plugin;
-	}
+        new Setting(containerEl)
+            .setName('OAuth Токен')
+            .addText(text => text
+                .setValue(this.plugin.settings.oauthToken)
+                .onChange(async (v) => { this.plugin.settings.oauthToken = v.trim(); await this.plugin.saveSettings(); }));
 
-	display(): void {
-		const {containerEl} = this;
+        new Setting(containerEl)
+            .setName('Папка на Диске')
+            .addText(text => text
+                .setValue(this.plugin.settings.remotePath)
+                .onChange(async (v) => { this.plugin.settings.remotePath = v.trim(); await this.plugin.saveSettings(); }));
+    }
 
-		containerEl.empty();
-
-		new Setting(containerEl)
-			.setName('Settings #1')
-			.setDesc('It\'s a secret')
-			.addText(text => text
-				.setPlaceholder('Enter your secret')
-				.setValue(this.plugin.settings.mySetting)
-				.onChange(async (value) => {
-					this.plugin.settings.mySetting = value;
-					await this.plugin.saveSettings();
-				}));
-	}
 }
